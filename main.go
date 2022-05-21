@@ -32,20 +32,21 @@ var (
 )
 
 type Context struct {
-	Args         []string
-	Cgroups      []string
-	AllCgroups   bool
-	Logs         bool
-	Notify       bool
-	Name         string
-	Env          bool
-	Rm           bool
-	Id           string
-	NotifySocket string
-	Cmd          *exec.Cmd
-	Pid          int
-	PidFile      string
-	Client       *dockerClient.Client
+	Args                 []string
+	Cgroups              []string
+	AllCgroups           bool
+	Logs                 bool
+	Notify               bool
+	Name                 string
+	Env                  bool
+	Rm                   bool
+	Id                   string
+	NotifySocket         string
+	Cmd                  *exec.Cmd
+	Pid                  int
+	PidFile              string
+	Client               *dockerClient.Client
+	WaitBeforeNotifySent string
 }
 
 func setupEnvironment(c *Context) {
@@ -85,6 +86,7 @@ func parseContext(args []string) (*Context, error) {
 	flags.BoolVar(&c.Notify, []string{"n", "-notify"}, false, "setup systemd notify for container")
 	flags.BoolVar(&c.Env, []string{"e", "-env"}, false, "inherit environment variable")
 	flags.Var(&flCgroups, []string{"c", "-cgroups"}, "cgroups to take ownership of or 'all' for all cgroups available")
+	flags.StringVar(&c.WaitBeforeNotifySent, []string{"w", "-wait-before-notify"}, "", "wait in seconds before notiy")
 
 	err := flags.Parse(args)
 	if err != nil {
@@ -545,6 +547,15 @@ func mainWithArgs(args []string) (*Context, error) {
 	_, err = moveCgroups(c)
 	if err != nil {
 		return c, err
+	}
+
+	// wait before notify, expecting container start not working.
+	if len(c.WaitBeforeNotifySent) > 0 {
+		var waitDuration, err = time.ParseDuration(c.WaitBeforeNotifySent)
+		if err != nil {
+			return c, err
+		}
+		time.Sleep(waitDuration)
 	}
 
 	err = notify(c)
