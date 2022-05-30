@@ -8,6 +8,7 @@ import (
 	"io/ioutil"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path"
@@ -25,10 +26,9 @@ import (
 )
 
 var (
-	SYSFS       string        = "/sys/fs/cgroup"
-	PROCS       string        = "cgroup.procs"
-	CGROUP_PROC string        = "/proc/%d/cgroup"
-	INTERVAL    time.Duration = 1000
+	SYSFS       = "/sys/fs/cgroup"
+	PROCS       = "cgroup.procs"
+	CGROUP_PROC = "/proc/%d/cgroup"
 )
 
 type Context struct {
@@ -47,6 +47,7 @@ type Context struct {
 	PidFile              string
 	Client               *dockerClient.Client
 	WaitBeforeNotifySent string
+	StartupProbe         string
 }
 
 func setupEnvironment(c *Context) {
@@ -86,7 +87,8 @@ func parseContext(args []string) (*Context, error) {
 	flags.BoolVar(&c.Notify, []string{"n", "-notify"}, false, "setup systemd notify for container")
 	flags.BoolVar(&c.Env, []string{"e", "-env"}, false, "inherit environment variable")
 	flags.Var(&flCgroups, []string{"c", "-cgroups"}, "cgroups to take ownership of or 'all' for all cgroups available")
-	flags.StringVar(&c.WaitBeforeNotifySent, []string{"w", "-wait-before-notify"}, "", "wait in seconds before notiy")
+	flags.StringVar(&c.WaitBeforeNotifySent, []string{"w", "-wait-before-notify"}, "", "wait in seconds before notify systemd")
+	flags.StringVar(&c.StartupProbe, []string{"s", "-startup-probe"}, "", "a endpoint url, to know when a container application has started")
 
 	err := flags.Parse(args)
 	if err != nil {
@@ -190,6 +192,18 @@ func lookupNamedContainer(c *Context) error {
 
 		return nil
 	}
+}
+
+func ContainerIsRunning(c *Context) (bool, error) {
+	client, err := getClient(c)
+	if err != nil {
+		return false, err
+	}
+	container, err := client.InspectContainer(c.Id)
+	if err != nil {
+		return false, nil
+	}
+	return container.State.Pid > 0, nil
 }
 
 func launchContainer(c *Context) error {
@@ -361,7 +375,7 @@ func moveCgroups(c *Context) (bool, error) {
 
 	if c.AllCgroups || c.Cgroups == nil || len(c.Cgroups) == 0 {
 		ns = make([]string, 0, len(containerCgroups))
-		for value, _ := range containerCgroups {
+		for value := range containerCgroups {
 			ns = append(ns, value)
 		}
 	} else {
@@ -550,12 +564,9 @@ func mainWithArgs(args []string) (*Context, error) {
 	}
 
 	// wait before notify, expecting container start not working.
-	if len(c.WaitBeforeNotifySent) > 0 {
-		var waitDuration, err = time.ParseDuration(c.WaitBeforeNotifySent)
-		if err != nil {
-			return c, err
-		}
-		time.Sleep(waitDuration)
+	_, err = waitForStartup(c)
+	if err != nil {
+		return c, err
 	}
 
 	err = notify(c)
@@ -583,9 +594,48 @@ func mainWithArgs(args []string) (*Context, error) {
 	return c, nil
 }
 
+func waitForStartup(c *Context) (*Context, error) {
+	var WaitDuration = time.Duration(0)
+	var err error
+	if len(c.WaitBeforeNotifySent) > 0 {
+		WaitDuration, err = time.ParseDuration(c.WaitBeforeNotifySent)
+		if err != nil {
+			return c, err
+		}
+	}
+
+	if len(c.StartupProbe) > 0 {
+		httpClient := http.Client{
+			Timeout: 500 * time.Millisecond,
+		}
+		var loopStepSleep = 100 * time.Millisecond
+		for start := time.Now(); time.Since(start) < WaitDuration; {
+
+			response, err := httpClient.Get(c.StartupProbe)
+			if err == nil {
+				if response.StatusCode == 200 {
+					return c, nil
+				}
+			}
+			isRunning, err := ContainerIsRunning(c)
+			if err != nil || !isRunning {
+				break
+			}
+			time.Sleep(loopStepSleep)
+		}
+		return c, fmt.Errorf("startup probe with %s: no http status 200 within time", c.StartupProbe)
+	} else {
+		time.Sleep(WaitDuration)
+	}
+	return c, nil
+}
+
 func main() {
-	_, err := mainWithArgs(os.Args[1:])
+	c, err := mainWithArgs(os.Args[1:])
 	if err != nil {
+		if c != nil && len(c.Id) > 0 {
+			rmContainer(c)
+		}
 		log.Fatal(err)
 	}
 }
